@@ -15,7 +15,9 @@ import 'dart:html' as dom;
 import 'dart:async';
 import 'dart:convert';
 
-logMsg(final String msg) {
+import 'package:opencv/fps.dart';
+
+void logMsg(final String msg) {
     final dom.PreElement output = dom.querySelector('#log') as dom.PreElement;
     var text = msg;
     if (!output.text.isEmpty) {
@@ -25,7 +27,7 @@ logMsg(final String msg) {
     output.scrollTop = output.scrollHeight;
 }
 
-dom.WebSocket initWebSocket([int retrySeconds = 10]) {
+dom.WebSocket initWebSocket(final FPS fps, bool isPauseState(), [final int retrySeconds = 10]) {
     var reconnectScheduled = false;
 
     logMsg("Connecting to websocket");
@@ -39,7 +41,8 @@ dom.WebSocket initWebSocket([int retrySeconds = 10]) {
 
     void scheduleReconnect() {
         if (!reconnectScheduled) {
-            new Timer(new Duration(milliseconds: 1000 * retrySeconds), () => initWebSocket(retrySeconds * 2));
+            new Timer(new Duration(milliseconds: 1000 * retrySeconds),
+                    () => initWebSocket(fps, isPauseState, retrySeconds * 2));
         }
         reconnectScheduled = true;
     }
@@ -47,12 +50,9 @@ dom.WebSocket initWebSocket([int retrySeconds = 10]) {
     ws.onOpen.listen((e) {
         logMsg('Connected');
         ws.send(JSON.encode({
-            "event" : "msg",
-            "data": {
-                "msg" : 'Hello from Dart!'
-            }
+            "event": "msg",
+            "data": {"msg": 'Hello from Dart!'}
         }));
-
     });
 
     ws.onClose.listen((e) {
@@ -67,16 +67,40 @@ dom.WebSocket initWebSocket([int retrySeconds = 10]) {
 
     ws.onMessage.listen((final dom.MessageEvent e) {
         final Map data = JSON.decode(e.data);
-        
-        switch(data["event"]) {
+
+        switch (data["event"]) {
             case "msg":
                 logMsg('Message: ${data["data"]["msg"]}');
                 break;
             case "tick":
                 logMsg('Tick: ${data["data"]["msg"]}');
                 break;
+            case "frame":
+                final canvasElement = dom.querySelector("#video") as dom.CanvasElement;
+                final contextElement = canvasElement.getContext("2d") as dom
+                    .CanvasRenderingContext2D;
+                final image = new dom.ImageElement(width: 422, height: 316);
+                final base64 = data["data"]["raw"] as String;
+
+                logMsg("Image: ${base64.substring(0, 35)}...${base64.substring(base64.length - 15)}");
+
+                // Trigger next frame
+                if (!isPauseState()) {
+                    ws.send(JSON.encode({"event": "pull-image"}));
+                }
+
+                image.src = "";
+                image.onLoad.listen((_) {
+                    //context.drawImage(image, canvas.width, canvas.height);
+                    contextElement.drawImageScaled(image, 0, 0, 422, 316);
+                    logMsg("Image should have changed...");
+                });
+                image.src = data["data"]["raw"] as String;
+
+                fps.update();
+                break;
             default:
-                logMsg('Unknown event: ${e.data}');
+                logMsg('Unknown event: ${data["event"]}');
         }
     });
 
@@ -84,20 +108,43 @@ dom.WebSocket initWebSocket([int retrySeconds = 10]) {
 }
 
 void main() {
-    final dom.WebSocket ws = initWebSocket();
-    final button = dom.querySelector("#broadcast") as dom.ButtonElement;
+    bool pauseState = true;
+    final FPS fps = new FPS();
+    final dom.WebSocket ws = initWebSocket(fps, () => pauseState);
+    final btnBroadcast = dom.querySelector("#broadcast") as dom.ButtonElement;
+    final btnPlay = dom.querySelector("#play") as dom.ButtonElement;
+    final btnPause = dom.querySelector("#pause") as dom.ButtonElement;
+    final fpsElement = dom.querySelector("#fps") as dom.SpanElement;
 
-    button.onClick.listen((_) {
-        if(ws.readyState == dom.WebSocket.OPEN) {
+    btnBroadcast.onClick.listen((_) {
+        if (ws.readyState == dom.WebSocket.OPEN) {
             final String message = (dom.querySelector("#message") as dom.InputElement).value;
-            if(message.isNotEmpty) {
+            if (message.isNotEmpty) {
                 ws.send(JSON.encode({
-                    "event" : "msg",
-                    "data": {
-                        "msg" : message
-                    }
+                    "event": "msg",
+                    "data": {"msg": message}
                 }));
             }
         }
     });
+
+    btnPlay.onClick.listen((_) {
+        if (ws.readyState == dom.WebSocket.OPEN) {
+            pauseState = false;
+            ws.send(JSON.encode({"event": "pull-image"}));
+        }
+        fps.start();
+    });
+
+    btnPause.onClick.listen((_) {
+        if (ws.readyState == dom.WebSocket.OPEN) {
+            pauseState = true;
+        }
+    });
+
+    new Timer.periodic(new Duration(seconds: 1), (_) {
+        fpsElement.text = fps.fps.toString();
+        fps.reset();
+    });
+
 }

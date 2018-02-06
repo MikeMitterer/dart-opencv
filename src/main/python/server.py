@@ -23,110 +23,104 @@
 # THE SOFTWARE.
 #
 ###############################################################################
-
+import signal
 import sys
 import json
+import base64
+import logging
+import time
 
+import imutils
 from twisted.internet import reactor
 from twisted.python import log
+from autobahn.twisted.websocket import WebSocketServerFactory, WebSocketServerProtocol, listenWS
 
-from autobahn.twisted.websocket import WebSocketServerFactory, \
-    WebSocketServerProtocol, \
-    listenWS
+from websocket.server import *
+from websocket.client import *
+from camera.camera import *
 
+ip = "192.168.0.120"
+cam_url = "rtsp://{ip}:554/user=admin&password=&channel=0&stream=0.sdp?real_stream--rtp-caching=100" \
+    .format(ip=ip)
 
-class WSClient(WebSocketServerProtocol):
-
-    def onOpen(self):
-        self.factory.register(self)
-
-    def onMessage(self, payload, isBinary):
-        if not isBinary:
-            log.msg(payload.decode('utf8'))
-            event = json.loads(payload.decode('utf8'))
-
-            msg = json.dumps({
-                "event": "msg",
-                "data": {
-                    "msg": "{} from {}".format(
-                        event["data"]["msg"],
-                        self.peer)
-                }
-            })
-
-            self.factory.broadcast(msg)
-
-    def connectionLost(self, reason):
-        WebSocketServerProtocol.connectionLost(self, reason)
-        self.factory.unregister(self)
+cam_url = 0
 
 
-class BroadcastServerFactory(WebSocketServerFactory):
+def frame2image(frame):
     """
-    Simple broadcast server broadcasting any message it receives to all
-    currently connected clients.
+    Converts a frame read by cv2.VideoCapture.read() into a base64-image
+
+    :param frame: Video-Frame
+    :return: base64 utf8 string
     """
 
-    def __init__(self, url):
-        WebSocketServerFactory.__init__(self, url)
-        self.clients = []
-        self.tickcount = 0
-        self.tick()
+    # Resize
+    # image_scaled = cv2.resize(frame, None, fx=300, fy=200)
+    image_scaled = imutils.resize(frame, width=400)
 
-    def tick(self):
-        self.tickcount += 1
+    retval, buffer = cv2.imencode('.png', image_scaled)
 
-        msg = json.dumps({
-            "event": "tick",
-            "data": {
-                "msg": "tick {} from server".format(self.tickcount),
-                "counter": self.tickcount
-            }
-        })
+    bytes = bytearray(buffer)
 
-        self.broadcast(msg)
-        reactor.callLater(10, self.tick)
+    b64_image = base64.b64encode(bytes)
+    b64_image = b64_image.decode('utf8')
 
-    def register(self, client):
-        if client not in self.clients:
-            print("registered client {}".format(client.peer))
-            self.clients.append(client)
-
-    def unregister(self, client):
-        if client in self.clients:
-            print("unregistered client {}".format(client.peer))
-            self.clients.remove(client)
-
-    def broadcast(self, msg):
-        print("broadcasting message '{}' ..".format(msg))
-        for c in self.clients:
-            c.sendMessage(msg.encode('utf8'))
-            print("message sent to {}".format(c.peer))
+    frame = None
+    return 'data:image/png;base64,' + b64_image
 
 
-class BroadcastPreparedServerFactory(BroadcastServerFactory):
+class ServiceExit(Exception):
     """
-    Functionally same as above, but optimized broadcast using
-    prepareMessage and sendPreparedMessage.
+    Custom exception which is used to trigger the clean exit
+    of all running threads and the main program.
     """
+    pass
 
-    def broadcast(self, msg):
-        print("broadcasting prepared message '{}' ..".format(msg))
 
-        prepared_msg = self.prepareMessage(msg)
-        for c in self.clients:
-            c.sendPreparedMessage(prepared_msg)
-            print("prepared message sent to {}".format(c.peer))
+def signal_handler_function(signum, frame):
+    logging.info('Caught signal %d' % signum)
+    raise ServiceExit
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.DEBUG)
+
+    observer = log.PythonLoggingObserver()
+    observer.start()
+
     log.startLogging(sys.stdout)
 
-    WSServerFactory = BroadcastServerFactory
-    # ServerFactory = BroadcastPreparedServerFactory
+    cam = Camera(cam_url)
 
-    factory = WSServerFactory(u"ws://127.0.0.1:9000")
-    factory.protocol = WSClient
-    listenWS(factory)
+    try:
+        #camThread = cam.init()
 
-    reactor.run()
+        WSServerFactory = BroadcastServerFactory
+        # ServerFactory = BroadcastPreparedServerFactory
+
+        factory = WSServerFactory(u"ws://127.0.0.1:9000", cam, frame2image)
+        factory.protocol = WSClient
+        listenWS(factory)
+
+        signal.signal(signal.SIGTERM, signal_handler_function)
+        reactor.run()
+
+    except ServiceExit:
+        logging.debug("Stopping threads and services...")
+
+    finally:
+        #reactor.stop()
+
+        # Terminate the running threads.
+        # Set the shutdown flag on each thread to trigger a clean shutdown of each thread.
+        cam.shutdown.set()
+
+        # Wait for the threads to close...
+        #camThread.join()
+
+
+    # Release camera and close windows
+    cam.release()
+    cv2.destroyAllWindows()
+    
+    logging.info("Exiting main program...")
